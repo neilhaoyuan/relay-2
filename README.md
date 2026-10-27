@@ -20,3 +20,5 @@ You'll need a Linux VM or server, Docker, Node.js, and your own Codex account. T
 Once configured, connect Tailscale on your device and open your server's Relay URL. Your server hosts the platform and stores your work.
 
 Relay is intended for one owner working on trusted repositories. Remote access is controlled by Tailscale; there is no separate Relay login. Future plans for this project include allowing for multiple owners to access without need tailscale. Seperate auth is WIP tho. 
+
+this is a cleaned up-version of the prior repo, other repo is deprecated now.
