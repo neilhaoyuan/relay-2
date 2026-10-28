@@ -239,7 +239,7 @@ async function openReview(ids: string[]): Promise<void> {
 $("project-options").addEventListener("click", event => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-project]"); if (!button) return;
   projectId = button.dataset.project!; $<HTMLDetailsElement>("project-switcher").open = false;
-  renderProjects(); renderList();
+  renderProjects(); renderList(); $<HTMLElement>("project-switcher").querySelector("summary")?.focus();
 });
 document.addEventListener("click", event => {
   const switcher = $<HTMLDetailsElement>("project-switcher");
