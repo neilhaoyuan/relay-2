@@ -15,4 +15,12 @@ Runs and events are stored in SQLite. Project files and the shared Codex login a
 
 ## Set up
 
-See the [Linux VM setup guide](docs/vm_setup.md) for installation, private access, Codex sign-in, and backups. The host needs Node.js, Docker, Git, and the workspace image. Codex sign-in is a one-time server setup step; it is not done in the browser.
+See the [Linux VM setup guide](docs/vm_setup.md) for setup. You'll need a Linux VM or server, Docker, Node.js, and your own Codex account. The guide includes requirements, service setup, first-workspace instructions, and troubleshooting.
+
+Once configured, connect Tailscale on your device and open your server's Relay URL. Your server hosts the platform and stores your work.
+
+Relay is intended for one owner working on trusted repositories. Remote access is controlled by Tailscale; there is no separate Relay login. Future plans for this project include allowing for multiple owners to access without need tailscale. Seperate auth is WIP tho. 
+
+## Note
+
+this is a cleaned up-version of the prior repo, other repo is deprecated now.
