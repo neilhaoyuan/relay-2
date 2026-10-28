@@ -1,6 +1,6 @@
 # Self-host Relay on a Linux VM
 
-This guide sets up your own Relay server with Docker workspaces, persistent storage, and private browser access through Tailscale. Use a Linux VM from your preferred provider, including Oracle Cloud, or a Linux server you already own. You supply and maintain the server and sign into your own GitHub and Codex accounts.
+This guide sets up your own Relay server with Docker workspaces, persistent storage, and private browser access through Tailscale. Use a Linux VM from your preferred provider, including Oracle Cloud, or a Linux server you already own. You supply and maintain the server and sign into your own GitHub and Codex accounts. The browser is a task inbox and review tool; server setup and Codex sign-in happen through SSH.
 
 ## Prerequisites
 
@@ -60,23 +60,32 @@ RELAY_PUBLIC_ORIGIN=https://your-vm.your-tailnet.ts.net
 
 Use no trailing slash or path. Keep the other settings, especially `RELAY_DATA_DIR`. Restart Relay: restart `npm start` for a manual launch, or run `sudo systemctl restart relay` if you installed the service below. Relay checks this host and origin for HTTP requests and WebSocket connections.
 
-On your other device, connect Tailscale and open that HTTPS URL. The IDE opens directly: Tailscale controls remote access, and Relay has no additional login screen. GitHub and Codex still require their own logins. Restrict the service to your intended devices/users through your Tailscale access rules.
+On your other device, connect Tailscale and open that HTTPS URL. The task inbox opens directly: Tailscale controls remote access, and Relay has no additional login screen. GitHub and Codex still require their own logins. Restrict the service to your intended devices/users through your Tailscale access rules.
 
 Daily use is now: connect Tailscale, open your saved Relay URL, and work. The VM and Relay must remain running. Tailscale must be connected on the viewing device. Enable the Relay systemd service below for startup after reboot.
 
-Check access from a second network, then open a workspace and verify that task updates and the terminal work. If requests or sockets fail, check the exact `RELAY_PUBLIC_ORIGIN` and restart Relay. If the URL cannot be reached, check both devices in `tailscale status`, your Tailscale access rules, and `tailscale serve status`. If Serve reports a backend error, check that Relay is running on port 8080.
+Check access from a second network, then open a task and verify that its updates appear. If requests or sockets fail, check the exact `RELAY_PUBLIC_ORIGIN` and restart Relay. If the URL cannot be reached, check both devices in `tailscale status`, your Tailscale access rules, and `tailscale serve status`. If Serve reports a backend error, check that Relay is running on port 8080.
 
 ## First workspace and Codex login
 
-Create a workspace from an HTTPS Git URL, an existing server-authorized `git@host:owner/repo.git` URL, or an empty repository. Private Git access uses the server user's Git/SSH setup. Never put an access token into the repository URL.
+Create a project from an HTTPS Git URL, an existing server-authorized `git@host:owner/repo.git` URL, or an empty repository. Private Git access uses the server user's Git/SSH setup. Never put an access token into the repository URL.
 
-Start the environment and open **Code**. Click **Log into Codex** in the terminal; this runs `codex login --device-auth`. Complete the displayed login flow. If your account does not permit device authentication, configure the supported Codex login method in that terminal before continuing. Relay does not implement its own OAuth flow.
+Sign into Codex once on the server as the same OS user that runs Relay. Set `DATA_DIR` to the absolute `RELAY_DATA_DIR` from your `.env` (`/var/lib/relay` with the supplied service unit, or the checkout's `.relay-data` for a manual launch), then run:
 
-The `/codex` directory is mounted from Relay's shared persistent Codex home. Log in once; new environments use that login while keeping separate source directories and thread IDs. This is intended for your own trusted repositories.
+```sh
+DATA_DIR=/var/lib/relay
+mkdir -p "$DATA_DIR/codex"
+docker run --rm -it --user "$(id -u):$(id -g)" \
+  --mount "type=bind,src=$DATA_DIR/codex,dst=/codex" \
+  -e CODEX_HOME=/codex -e HOME=/codex \
+  relay-workspace:0.1.0 codex login --device-auth
+```
 
-Use the terminal to install dependencies (`npm ci` where a lockfile exists), run tests, or inspect Git. Dependency directories are not copied into experiments; install them again there as needed.
+Complete the displayed device login. If your account does not permit device authentication, use another supported Codex login method with the same mounted home. Relay does not implement its own OAuth flow. New environments share this login while keeping separate source directories and thread IDs. Keep the data directory private because it contains credentials.
 
-Return to **Tasks** to create a named task in an isolated copy or directly in the primary workspace. Follow its output and approvals there. **Experiments** lists independent attempts and lets you select two for comparison. **Review** shows changed files and explicit application controls. **Code** remains available for manual editing and terminal access; switching views does not stop a task or clear unsaved edits.
+Use **New task** to give Codex work in an isolated copy. Choose **Compare two attempts** to start two copies from the same snapshot. The inbox shows live runs and decisions that need you. Open a finished run, inspect the changed files, and apply its result when ready. Relay does not commit or push the applied files.
+
+The browser has no editor or terminal. Use SSH and `docker exec` for manual repository setup, dependency installation, or Git commands. Dependency directories are not copied into attempts; install them in each attempt when needed, or ask the agent to do so.
 
 ## Install as a service
 
@@ -115,11 +124,11 @@ docker ps --filter label=relay.installation
 
 The local test suite does not replace these real-infrastructure checks:
 
-1. Build and start the image on the VM's actual architecture. Check `node --version`, `git --version`, and `codex --version` inside a workspace terminal.
-2. Log into Codex. Ask it to create a small file and run a command. Verify structured output and the resulting file in the editor.
+1. Build and start the image on the VM's actual architecture. Check `node --version`, `git --version`, and `codex --version` with `docker run --rm relay-workspace:0.1.0 <command>`.
+2. Log into Codex through the mounted home above. Ask it to create a small file and run a command. Verify the activity and changed file in Review.
 3. Close all browser tabs while a task runs; reconnect and inspect the same run and its retained output.
 4. Stop and restart a workspace. Verify files and the saved Codex login survive.
-5. Create an experiment from a dirty primary workspace. Verify the copied changes, edit the experiment, and check that the primary is unchanged.
+5. Create an isolated task from a dirty primary workspace. Verify its copied changes and check that the primary is unchanged before applying.
 6. Launch two parallel tasks. Verify separate files/threads and observe their resource limits using `docker stats`. If testing a larger batch through the API, confirm extra tasks queue and completed workers free capacity.
 7. Cancel one task that has a long-running shell command. Verify its container stops and its sibling continues.
 8. Review and apply one result. Then create another result, modify the primary, and verify stale promotion is rejected.
@@ -134,11 +143,10 @@ Discard temporary workspaces through the UI after retaining desired changes. Thi
 
 ## Troubleshooting
 
-- **Docker unavailable:** check the daemon and the backend user's Docker access. Browsing/editing files can still work.
+- **Docker unavailable:** check the daemon and the backend user's Docker access. Existing task history remains available.
 - **Image unavailable:** run the image build command; allow up to 15 seconds for the UI status to refresh.
 - **Queued tasks do not start:** inspect idle primary/experiment containers and stop one, or adjust limits to fit the host. Parallel worker containers stop automatically when done.
-- **Codex authentication failure:** open a running environment's terminal and run `codex login status`, then sign in again if needed.
+- **Codex authentication failure:** repeat the mounted-home login command above as the Relay service user. You can replace `login --device-auth` with `login status` to inspect it.
 - **Request origin rejected:** match `RELAY_PUBLIC_ORIGIN` to the exact browser origin and restart the backend.
-- **Save conflict:** reload the file and reconcile your edits with the newer contents.
 - **Snapshot rejected:** remove unsupported symlinks/submodules or exclude generated output. Limits are 20,000 entries and 128 MiB of eligible source.
 - **Interrupted promotion:** inspect the primary files and the SQLite operation record marked `needs-review`; do not assume the patch is unapplied. Resolve manually and take a fresh snapshot.

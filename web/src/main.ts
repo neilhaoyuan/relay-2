@@ -1,418 +1,306 @@
-/** Browser workspace controller: IDE files, container controls, agent history, and manual experiments. */
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import type { Workspace, AgentRun, RunEvent, FileEntry, FileDocument, ChangeProposal, SystemStatus } from "@relay/contracts";
-import { api, socketUrl } from "./api";
-import { CodeEditor } from "./editor";
-import { Layout, commandPalette } from "./layout";
-import { TaskBoard } from "./tasks";
-import { ChangeReview } from "./review";
+import type { AgentRun, ChangeProposal, RunEvent, Workspace, SystemStatus } from "@relay/contracts";
+import { api, eventsSocket } from "./api";
 import "./style.css";
 
-const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id)! as T;
-const escape = (text: string) => text.replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
 type State = { workspaces: Workspace[]; runs: AgentRun[]; system: SystemStatus };
-let state: State, selectedId = "", selectedRunId = "", currentFile = "";
-let authenticated = false, eventSocket: WebSocket | undefined, terminalSocket: WebSocket | undefined;
-type View = "tasks" | "experiments" | "review" | "code";
-let view: View = "tasks";
-let terminalWorkspace = "", refreshTimer: number | undefined, refreshing = false;
-const documents = new Map<string, FileDocument & { saved: string }>();
-const runEvents = new Map<string, RunEvent[]>();
-const layout = new Layout();
-const board = new TaskBoard({
-  select: run => void action(async () => { await chooseWorkspace(run.workspaceId); if (selectedId !== run.workspaceId) return; selectedRunId = run.id; setView("tasks"); renderState(); await catchUp(run.id); }),
-  review: ids => { setView("review"); void reviews.open(ids); },
-  code: id => void action(() => showCode(id)),
-  discard: id => void action(() => discardWorkspace(id)),
-});
-const reviews = new ChangeReview({
-  code: (id, path) => void action(async () => { await showCode(id); if (selectedId === id && path) await openFile(path); }),
-  error: message => toast(message),
-  apply: async proposal => {
-    if (dirty() && [proposal.workspaceId, proposal.parentId].includes(selectedId)) throw new Error("Save or discard editor changes before applying this review.");
-    if (!confirm("Apply this entire reviewed diff to the primary workspace? This changes its files without committing or pushing.")) return;
-    const applied = await api<ChangeProposal>(`/changes/${proposal.id}/apply`, "POST", {});
-    proposal.appliedAt = applied.appliedAt; await refresh(); toast("Changes applied to the primary workspace");
-  },
-});
-const finished = new Set(["completed", "failed", "cancelled", "interrupted"]);
-const workspacePath = (id = selectedId) => `/workspaces/${id}`;
-const selected = () => state?.workspaces.find(workspace => workspace.id === selectedId);
-const busy = () => state?.runs.some(run => run.workspaceId === selectedId && !finished.has(run.state));
-const dirty = () => [...documents.values()].some(document => document.content !== document.saved);
-let toastTimer: number | undefined;
-function toast(message: string): void { $("toast").textContent = message; $("toast").hidden = false; clearTimeout(toastTimer); toastTimer = window.setTimeout(() => { $("toast").hidden = true; }, 7000); }
-async function action(work: () => Promise<void>): Promise<void> { try { await work(); } catch (error) { toast((error as Error).message); } }
-function on(id: string, work: () => Promise<void> | void): void {
-  $(id).addEventListener("click", () => { void action(async () => { const button = $<HTMLButtonElement>(id); button.disabled = true; try { await work(); } finally { button.disabled = false; renderControls(); } }); });
+type Approval = { id: string | number; method: string; params: Record<string, unknown> };
+type Screen = "activity" | "review";
+const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id)! as T;
+const html = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
+const ended = new Set(["completed", "failed", "cancelled", "interrupted"]);
+const labels: Record<string, string> = { queued: "Queued", starting: "Starting", running: "Working", waiting: "Needs approval", stopping: "Stopping", completed: "Finished", failed: "Failed", cancelled: "Cancelled", interrupted: "Interrupted" };
+const when = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+let state: State = { workspaces: [], runs: [], system: {} as SystemStatus };
+let projectId = "all", selectedRunId = new URL(location.href).searchParams.get("run") ?? "", filter: "open" | "all" = "open";
+let mobileDetailOpen = !!selectedRunId;
+let screen: Screen = "activity", reviewIds: string[] = [], socket: WebSocket | undefined;
+let refreshing = false, refreshQueued = false, eventCursor = 0, toastTimer = 0;
+let events: RunEvent[] = [], approvals: Approval[] = [], detailKey = "";
+const proposals = new Map<string, ChangeProposal>(), chosenFiles = new Map<string, number>();
+
+function notice(message: string): void {
+  const target = $("toast"); target.textContent = message; target.hidden = false;
+  clearTimeout(toastTimer); toastTimer = window.setTimeout(() => target.hidden = true, 5500);
+}
+async function runAction(work: () => Promise<void>): Promise<void> {
+  try { await work(); } catch (error) { notice((error as Error).message); }
+}
+function workspace(id: string): Workspace | undefined { return state.workspaces.find(item => item.id === id); }
+function run(id = selectedRunId): AgentRun | undefined { return state.runs.find(item => item.id === id); }
+function project(item: Workspace | undefined): Workspace | undefined { return workspace(item?.parentId ?? item?.id ?? ""); }
+function isBusy(id: string): boolean { return state.runs.some(item => item.workspaceId === id && !ended.has(item.state)); }
+function isReady(item: AgentRun): boolean {
+  const source = workspace(item.workspaceId);
+  return ended.has(item.state) && !!source?.parentId && !source.appliedAt && source.state !== "discarded";
+}
+function category(item: AgentRun): string {
+  return item.state === "waiting" ? "Needs you" : !ended.has(item.state) ? "In progress" : isReady(item) ? "Ready to review" : "History";
+}
+function projectMatches(item: AgentRun): boolean {
+  return projectId === "all" || (workspace(item.workspaceId)?.parentId ?? item.workspaceId) === projectId;
 }
 
-const editor = new CodeEditor($("editor"), content => {
-  const document = documents.get(currentFile); if (!document) return;
-  document.content = content; renderTabs();
-}, () => void action(saveFile));
-const terminal = new Terminal({ theme: { background: "#1e1e1e", foreground: "#cccccc", cursor: "#aeafad" }, fontSize: 12, fontFamily: "'Cascadia Code', Consolas, monospace", cursorBlink: true, scrollback: 4000 });
-const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open($("terminal"));
-function resizeTerminal(): void {
-  if ($("terminal").clientWidth < 10 || $("terminal").clientHeight < 10) return;
-  fit.fit(); if (terminalSocket?.readyState === WebSocket.OPEN) terminalSocket.send(JSON.stringify({ type: "resize", cols: terminal.cols, rows: terminal.rows }));
+function renderProjects(): void {
+  const primaries = state.workspaces.filter(item => item.kind === "primary" && item.state !== "discarded");
+  if (projectId !== "all" && !primaries.some(item => item.id === projectId)) projectId = "all";
+  $("project-title").textContent = projectId === "all" ? "All projects" : primaries.find(item => item.id === projectId)?.name ?? "All projects";
+  const options = [{ id: "all", name: "All projects" }, ...primaries].map(item => `<button type="button" data-project="${item.id}" class="project-option" aria-current="${item.id === projectId ? "true" : "false"}"><span>${html(item.name)}</span>${item.id === projectId ? "<small>Current</small>" : ""}</button>`).join("");
+  if ($("project-options").innerHTML !== options) $("project-options").innerHTML = options;
 }
-new ResizeObserver(resizeTerminal).observe($("terminal"));
-terminal.onData(data => { if (terminalSocket?.readyState === WebSocket.OPEN) terminalSocket.send(JSON.stringify({ type: "input", data })); });
-
-function renderControls(): void {
-  const workspace = selected(); if (!workspace) { for (const id of ["send-prompt", "task-open-code", "task-review", "codex-login", "connect-terminal"]) $<HTMLButtonElement>(id).disabled = true; return; }
-  $("workspace-name").textContent = workspace.name;
-  $("window-title").textContent = workspace.name;
-  $("explorer-name").textContent = workspace.name.toUpperCase();
-  document.title = `${workspace.name} — Relay`;
-  $("workspace-kind").textContent = workspace.kind === "primary" ? "PRIMARY WORKSPACE" : workspace.kind === "agent" ? "PARALLEL AGENT" : "EXPERIMENT";
-  $("environment-toggle").textContent = workspace.state === "running" ? "Stop environment" : "Start environment";
-  $<HTMLButtonElement>("environment-toggle").disabled = !state.system.docker || (!state.system.imageReady && workspace.state !== "running");
-  for (const id of ["experiment-button", "parallel-button"]) { $(id).hidden = workspace.kind !== "primary"; $<HTMLButtonElement>(id).disabled = !!busy() || !state.system.docker; }
-  $("review-button").hidden = workspace.kind === "primary"; $<HTMLButtonElement>("review-button").disabled = !!busy() || !!workspace.appliedAt;
-  $("discard-button").hidden = workspace.kind === "primary"; $<HTMLButtonElement>("discard-button").disabled = !!busy();
-  $<HTMLButtonElement>("send-prompt").disabled = !!busy() || !state.system.docker || !state.system.imageReady;
-  $<HTMLButtonElement>("connect-terminal").disabled = workspace.state !== "running";
-  $<HTMLButtonElement>("codex-login").disabled = workspace.state !== "running";
-  $("runtime-notice").hidden = state.system.docker && state.system.imageReady;
-  $("runtime-notice").textContent = state.system.message;
-  const run = state.runs.find(run => run.id === selectedRunId);
-  $("agent-state").textContent = run?.state ?? "Ready"; $("agent-state").className = `badge ${run?.state ?? ""}`;
-  $("cancel-run").hidden = !run || finished.has(run.state);
-  if (workspace.state !== "running" && terminalSocket) detachTerminal();
-  $("terminal-message").textContent = workspace.state === "running" ? "Connect to open a shell. Log into Codex once before your first task." : "Start the environment to use its terminal.";
-  $("terminal-message").hidden = terminalSocket?.readyState === WebSocket.OPEN;
-  $("task-open-code").textContent = `Open code · ${workspace.name}`;
-  $<HTMLButtonElement>("task-open-code").disabled = workspace.state === "discarded";
-  $<HTMLButtonElement>("task-review").disabled = workspace.kind === "primary" || !!busy() || !!workspace.appliedAt || workspace.state === "discarded";
-  $("prompt").setAttribute("placeholder", run ? "Continue this conversation…" : "Describe a task…");
-  $("send-prompt").textContent = run ? "Continue" : "Run task";
-  if (workspace.state === "discarded") for (const id of ["environment-toggle", "send-prompt", "review-button", "discard-button"]) $<HTMLButtonElement>(id).disabled = true;
+function renderList(): void {
+  const open = filter === "open";
+  for (const name of ["open", "all"] as const) {
+    const button = $<HTMLButtonElement>(`filter-${name}`); button.classList.toggle("active", filter === name); button.setAttribute("aria-pressed", String(filter === name));
+  }
+  const visible = state.runs.filter(projectMatches).filter(item => !open || category(item) !== "History");
+  const order = ["Needs you", "In progress", "Ready to review", "History"];
+  const content = order.map(group => {
+    const items = visible.filter(item => category(item) === group).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    if (!items.length) return "";
+    return `<div class="list-group"><h2>${group} <span>${items.length}</span></h2>${items.map(item => {
+      const source = workspace(item.workspaceId), parent = project(source);
+      return `<button class="task-row ${item.id === selectedRunId ? "selected" : ""}" data-run="${item.id}" type="button" aria-current="${item.id === selectedRunId ? "true" : "false"}">
+        <span class="task-row-top"><span class="status ${item.state}"><i></i>${labels[item.state]}</span><time>${html(when(item.createdAt))}</time></span>
+        <strong>${html(item.title ?? item.prompt)}</strong>
+        <span class="task-row-project">${html(parent?.name ?? source?.name ?? "Project")}${source?.kind === "agent" ? " · Isolated" : ""}</span>
+      </button>`;
+    }).join("")}</div>`;
+  }).join("");
+  $("task-list").innerHTML = content || `<div class="empty-list"><h2>${state.workspaces.length ? open && state.runs.length ? "No open tasks" : "No tasks" : "No projects"}</h2><button class="button" data-action="${state.workspaces.length ? "new-task" : "new-project"}" type="button">${state.workspaces.length ? "New task" : "New project"}</button></div>`;
 }
-function renderState(): void {
-  const workspaces = state.workspaces.filter(workspace => workspace.state !== "discarded");
-  $("workspaces").innerHTML = workspaces.length ? workspaces.map(workspace => `<button class="workspace-item ${workspace.id === selectedId ? "selected" : ""} ${workspace.kind !== "primary" ? "child" : ""}" data-workspace="${workspace.id}" title="${escape(workspace.name)}"><span class="workspace-glyph">${workspace.kind === "primary" ? "▣" : workspace.kind === "experiment" ? "◇" : "⑂"}</span><span><strong>${escape(workspace.name)}</strong><small>${workspace.kind === "primary" ? "Primary" : workspace.kind === "agent" ? "Agent" : "Experiment"}${workspace.appliedAt ? " · Applied" : ""}</small></span></button>`).join("") : '<p class="small muted" style="padding:10px">Your projects will appear here.</p>';
-  $("welcome").hidden = view !== "code" || !!selectedId; $("workspace-view").hidden = view !== "code" || !selectedId;
-  $("workspace-header").hidden = !selectedId;
-  for (const id of ["new-file", "refresh-files"]) $<HTMLButtonElement>(id).disabled = !selectedId || selected()?.state === "discarded";
-  board.update(state, selectedRunId); reviews.update(state);
-  board.activity(state.runs.find(run => run.id === selectedRunId), runEvents.get(selectedRunId) ?? []);
-  renderControls();
-  if (!selectedId) return;
-  const runs = state.runs.filter(run => run.workspaceId === selectedId).reverse();
-  const history = $<HTMLSelectElement>("run-history");
-  history.innerHTML = runs.length ? runs.map(run => `<option value="${run.id}">${escape((run.title ?? run.prompt).slice(0,48))} · ${run.state}</option>`).join("") : '<option value="">No tasks yet</option>';
-  if (!runs.some(run => run.id === selectedRunId)) selectedRunId = runs[0]?.id ?? "";
-  history.value = selectedRunId; renderControls(); board.update(state, selectedRunId);
+function setSelection(id: string, next: Screen = "activity"): void {
+  if (id !== selectedRunId) { events = []; approvals = []; eventCursor = 0; }
+  selectedRunId = id; screen = next; detailKey = ""; mobileDetailOpen = !!id;
+  const url = new URL(location.href);
+  if (id) url.searchParams.set("run", id); else url.searchParams.delete("run");
+  history.replaceState(null, "", url);
+  $("shell").classList.toggle("show-detail", mobileDetailOpen);
+  renderList(); renderDetail();
+  if (id) void runAction(() => loadRun(id));
+}
+async function loadRun(id: string): Promise<void> {
+  for (;;) {
+    const batch = await api<RunEvent[]>(`/runs/${id}/events?after=${eventCursor}`);
+    if (id !== selectedRunId) return;
+    for (const event of batch) if (event.sequence > eventCursor) { events.push(event); eventCursor = event.sequence; }
+    if (batch.length < 500) break;
+  }
+  const pending = await api<Approval[]>(`/runs/${id}/approvals`);
+  if (id !== selectedRunId) return;
+  approvals = pending; renderDetail();
 }
 async function refresh(): Promise<void> {
-  if (!authenticated || refreshing) return;
+  if (refreshing) { refreshQueued = true; return; }
   refreshing = true;
   try {
     state = await api<State>("/state");
-    if (selectedId && !state.workspaces.some(workspace => workspace.id === selectedId)) selectedId = "";
-    renderState(); if (selectedRunId) await catchUp(selectedRunId);
-  } finally { refreshing = false; }
+    if (selectedRunId && !run()) selectedRunId = "";
+    if (!selectedRunId && state.runs.length && matchMedia("(min-width: 760px)").matches) {
+      selectedRunId = [...state.runs].sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0].id;
+    }
+    $("shell").classList.toggle("show-detail", mobileDetailOpen && !!selectedRunId);
+    $("updated-at").textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+    renderProjects(); renderList();
+    if (selectedRunId) await loadRun(selectedRunId); else renderDetail();
+  } finally {
+    refreshing = false;
+    if (refreshQueued) { refreshQueued = false; void runAction(refresh); }
+  }
 }
-function scheduleRefresh(): void { if (refreshTimer !== undefined) return; refreshTimer = window.setTimeout(() => { refreshTimer = undefined; void action(refresh); }, 300); }
-function connectEvents(): void {
-  if (!authenticated) return;
-  const socket = new WebSocket(socketUrl("/ws/events")); eventSocket = socket;
-  socket.onopen = scheduleRefresh;
-  socket.onmessage = scheduleRefresh;
-  socket.onclose = () => { if (!authenticated) return; window.setTimeout(connectEvents, 2000); };
+function connect(): void {
+  socket = eventsSocket();
+  socket.onmessage = () => void runAction(refresh);
+  socket.onopen = () => void runAction(refresh);
+  socket.onclose = () => window.setTimeout(connect, 2500);
 }
 
-async function chooseWorkspace(id: string): Promise<void> {
-  if (id === selectedId) return;
-  if (dirty() && !confirm("Discard unsaved editor changes before switching workspaces?")) return;
-  detachTerminal(); selectedId = id; selectedRunId = ""; currentFile = ""; documents.clear(); editor.clear();
-  delete $("agent-output").dataset.renderKey;
-  $("editor").hidden = true; $("editor-placeholder").hidden = false; $("agent-output").innerHTML = '<div class="agent-empty"><h2>No active task</h2><p>Start an environment and sign into Codex to run a task.</p></div>';
-  $("approvals").replaceChildren(); renderTabs(); renderState();
-  if (selected()?.state !== "discarded") await loadTree(); else $("file-tree").textContent = "This workspace was discarded. Task history is retained.";
-  if (selectedRunId) await catchUp(selectedRunId);
-  if (selected()?.state === "running") await connectTerminal();
-}
-$("workspaces").addEventListener("click", event => { const button = (event.target as HTMLElement).closest<HTMLElement>("[data-workspace]"); if (button) void action(() => chooseWorkspace(button.dataset.workspace!)); });
-
-async function loadTree(): Promise<void> { const id = selectedId; const entries = await api<FileEntry[]>(`${workspacePath(id)}/files`); if (id !== selectedId) return; $("file-tree").replaceChildren(tree(entries, id)); }
-function tree(entries: FileEntry[], id: string): DocumentFragment {
-  const fragment = document.createDocumentFragment();
-  for (const entry of entries) {
-    if (entry.kind === "directory") {
-      const details = document.createElement("details"), summary = document.createElement("summary"), children = document.createElement("div");
-      summary.className = "tree-row"; summary.textContent = entry.name; details.append(summary, children);
-      details.addEventListener("toggle", () => { if (details.open && !children.childNodes.length) void action(async () => { const items = await api<FileEntry[]>(`${workspacePath(id)}/files?path=${encodeURIComponent(entry.path)}`); children.replaceChildren(tree(items, id)); }); });
-      fragment.append(details);
-    } else {
-      const button = document.createElement("button"); button.className = "tree-row"; button.title = entry.path;
-      button.dataset.path = entry.path;
-      button.innerHTML = `<span>⌑</span><span>${escape(entry.name)}</span>`;
-      button.addEventListener("click", () => { if (id === selectedId) void action(() => openFile(entry.path)); }); fragment.append(button);
+type Item = { id: string; type: string; title: string; text: string; status?: string };
+function activityItems(): Item[] {
+  const items = new Map<string, Item>();
+  for (const event of events) {
+    const data = event.data as { item?: { id: string; type: string; text?: string; command?: string; aggregatedOutput?: string; status?: string; exitCode?: number; changes?: unknown }; itemId?: string; delta?: string };
+    if (event.type === "item/agentMessage/delta" || event.type === "item/commandExecution/outputDelta") {
+      const id = data.itemId ?? String(event.sequence), message = event.type.includes("agentMessage");
+      const item = items.get(id) ?? { id, type: message ? "message" : "command", title: message ? "Agent" : "Command", text: "" };
+      item.text += data.delta ?? ""; items.set(id, item);
+    }
+    if ((event.type === "item/started" || event.type === "item/completed") && data.item) {
+      const source = data.item, previous = items.get(source.id);
+      if (source.type === "agentMessage") items.set(source.id, { id: source.id, type: "message", title: "Agent", text: source.text ?? previous?.text ?? "" });
+      if (source.type === "commandExecution") items.set(source.id, { id: source.id, type: "command", title: source.command ?? "Command", text: source.aggregatedOutput ?? previous?.text ?? "", status: source.exitCode == null ? source.status : `Exit ${source.exitCode}` });
+      if (source.type === "fileChange") items.set(source.id, { id: source.id, type: "files", title: "Files changed", text: JSON.stringify(source.changes ?? [], null, 2), status: source.status });
     }
   }
-  return fragment;
+  return [...items.values()];
 }
-async function openFile(path: string, reload = false): Promise<void> {
-  const id = selectedId;
-  if (!documents.has(path) || reload) {
-    const file = await api<FileDocument>(`${workspacePath(id)}/file?path=${encodeURIComponent(path)}`);
-    if (id !== selectedId) return; documents.set(path, { ...file, saved: file.content });
-  }
-  currentFile = path; $("editor").hidden = false; $("editor-placeholder").hidden = true;
-  editor.open(path, documents.get(path)!.content); renderTabs(); editor.focus(); layout.closeMobileSidebar();
+function renderActivity(item: AgentRun): string {
+  const source = workspace(item.workspaceId), parent = project(source), active = !ended.has(item.state);
+  const siblings = state.workspaces.filter(w => w.groupId && w.groupId === source?.groupId && w.id !== source.id && !isBusy(w.id) && !w.appliedAt && w.state !== "discarded");
+  const timeline = activityItems();
+  return `<div class="detail-body">
+    <button class="back-link" data-action="back" type="button">All tasks</button>
+    <div class="detail-heading"><p class="eyebrow">${html(parent?.name ?? source?.name ?? "Project")} <span class="dot">·</span> ${html(when(item.createdAt))}</p><h1>${html(item.title ?? item.prompt)}</h1><div class="detail-meta"><span class="status ${item.state}"><i></i>${labels[item.state]}</span>${source?.parentId ? '<span>Isolated copy</span>' : '<span>Primary project</span>'}</div></div>
+    ${item.error ? `<div class="inline-error" role="alert">${html(item.error)}</div>` : ""}
+    ${approvals.map(request => `<section class="approval"><p class="eyebrow">Decision needed</p><h2>Agent requests approval</h2><pre>${html(request.params.command ?? request.params.reason ?? "Review the proposed file change.")}</pre><div class="action-row"><button class="button primary" data-action="approve" data-request="${html(request.id)}" type="button">Allow</button><button class="button" data-action="decline" data-request="${html(request.id)}" type="button">Decline</button></div></section>`).join("")}
+    <section class="task-prompt"><h2>Instructions</h2><p>${html(item.prompt)}</p></section>
+    <section class="activity-log"><div class="section-line"><h2>Activity</h2><span>${timeline.length ? `${timeline.length} updates` : active ? "Live" : "No updates"}</span></div>
+      ${timeline.length ? timeline.map(entry => entry.type === "message" ? `<div class="log-message"><span class="log-label">Agent</span><p>${html(entry.text)}</p></div>` : `<details class="log-tool"><summary><span>${html(entry.title)}</span><small>${html(entry.status ?? "")}</small></summary><pre>${html(entry.text.slice(-20000) || "No output")}</pre></details>`).join("") : `<p class="quiet-line">${item.state === "queued" ? "Waiting for capacity." : active ? "Starting…" : "No activity recorded."}</p>`}
+    </section>
+    <div class="detail-actions">
+      ${source?.parentId && !active && !source.appliedAt && source.state !== "discarded" ? '<button class="button primary" data-action="review" type="button">Review changes</button>' : ""}
+      ${siblings.length ? `<button class="button" data-action="compare" data-other="${siblings[0].id}" type="button">Compare attempts</button>` : ""}
+      ${!active && source?.state !== "discarded" ? '<button class="button" data-action="continue" type="button">Continue task</button>' : ""}
+      ${active ? '<button class="button danger" data-action="cancel" type="button">Cancel run</button>' : ""}
+      ${source?.parentId && !active && source.state !== "discarded" ? '<button class="text-button muted-action" data-action="discard" type="button">Discard copy</button>' : ""}
+    </div>
+  </div>`;
 }
-function renderTabs(): void {
-  $("file-tabs").innerHTML = [...documents.values()].map(document => `<div class="file-tab ${document.path === currentFile ? "active" : ""}" draggable="true" data-file="${escape(document.path)}" title="${escape(document.path)}"><button role="tab" aria-selected="${document.path === currentFile}" tabindex="${document.path === currentFile ? 0 : -1}"><span class="file-symbol">${escape(document.path.split(".").pop()?.slice(0,3) ?? "")}</span>${escape(document.path.split("/").pop()!)}${document.content !== document.saved ? " •" : ""}</button><button class="tab-close" data-close="true" aria-label="Close ${escape(document.path)}">×</button></div>`).join("");
-  document.querySelectorAll<HTMLElement>("[data-path]").forEach(row => row.classList.toggle("active", row.dataset.path === currentFile));
-  const file = documents.get(currentFile);
-  $<HTMLButtonElement>("save-file").disabled = !file || file.content === file.saved;
-  $("file-status").textContent = file ? `${file.path}${file.content !== file.saved ? " · Unsaved" : " · Saved"}` : "No file open";
-}
-async function closeFile(path: string): Promise<void> {
-  const file = documents.get(path); if (!file) return;
-  if (file.content !== file.saved && !confirm(`Discard unsaved changes to ${path}?`)) return;
-  const paths = [...documents.keys()], index = paths.indexOf(path);
-  documents.delete(path); editor.forget(path);
-  if (currentFile === path) {
-    currentFile = "";
-    const next = [...documents.keys()][Math.min(index, documents.size - 1)];
-    if (next) await openFile(next);
-    else { $("editor").hidden = true; $("editor-placeholder").hidden = false; }
-  }
-  renderTabs();
-}
-$("file-tabs").addEventListener("click", event => {
-  const target = event.target as HTMLElement, tab = target.closest<HTMLElement>("[data-file]");
-  if (tab) void action(() => target.closest("[data-close]") ? closeFile(tab.dataset.file!) : openFile(tab.dataset.file!));
-});
-$("file-tabs").addEventListener("keydown", event => {
-  if (!["ArrowLeft", "ArrowRight", "Delete"].includes(event.key)) return;
-  const tab = (event.target as HTMLElement).closest<HTMLElement>("[data-file]"); if (!tab) return;
-  event.preventDefault();
-  if (event.key === "Delete") { void action(() => closeFile(tab.dataset.file!)); return; }
-  const paths = [...documents.keys()], index = paths.indexOf(tab.dataset.file!);
-  const next = paths[(index + (event.key === "ArrowRight" ? 1 : -1) + paths.length) % paths.length];
-  void action(async () => { await openFile(next); $("file-tabs").querySelector<HTMLElement>('[aria-selected="true"]')?.focus(); });
-});
-let draggedTab = "";
-$("file-tabs").addEventListener("dragstart", event => {
-  draggedTab = (event.target as HTMLElement).closest<HTMLElement>("[data-file]")?.dataset.file ?? "";
-  if (event.dataTransfer) { event.dataTransfer.setData("text/plain", draggedTab); event.dataTransfer.effectAllowed = "move"; }
-});
-$("file-tabs").addEventListener("dragover", event => {
-  if (!draggedTab) return; event.preventDefault();
-  $("file-tabs").querySelectorAll(".drop-target").forEach(tab => tab.classList.remove("drop-target"));
-  (event.target as HTMLElement).closest("[data-file]")?.classList.add("drop-target");
-});
-$("file-tabs").addEventListener("drop", event => {
-  if (!draggedTab) return; event.preventDefault();
-  const target = (event.target as HTMLElement).closest<HTMLElement>("[data-file]")?.dataset.file;
-  if (target !== draggedTab && documents.has(draggedTab)) {
-    const entries = [...documents.entries()], moving = entries.find(([path]) => path === draggedTab)!;
-    const rest = entries.filter(([path]) => path !== draggedTab), index = rest.findIndex(([path]) => path === target);
-    rest.splice(index < 0 ? rest.length : index, 0, moving); documents.clear(); rest.forEach(([path, value]) => documents.set(path, value));
-  }
-  draggedTab = ""; renderTabs();
-});
-$("file-tabs").addEventListener("dragend", () => { draggedTab = ""; $("file-tabs").querySelectorAll(".drop-target").forEach(tab => tab.classList.remove("drop-target")); });
-async function saveFile(): Promise<void> {
-  const file = documents.get(currentFile), id = selectedId; if (!file) return;
-  const content = file.content;
-  const saved = await api<FileDocument>(`${workspacePath(id)}/file`, "PUT", { path: file.path, content, version: file.version });
-  if (id !== selectedId) return;
-  file.saved = content; file.version = saved.version; renderTabs();
-}
-on("save-file", saveFile); on("refresh-files", loadTree);
-on("reload-file", async () => { if (!currentFile) return; const file = documents.get(currentFile)!; if (file.content !== file.saved && !confirm("Discard your unsaved edits and reload this file?")) return; await openFile(currentFile, true); });
-
-type ModalSubmit = (data: FormData) => Promise<void>;
-let modalSubmit: ModalSubmit = async () => {};
-function modal(title: string, content: string, submitLabel: string, submit: ModalSubmit): void {
-  $("modal-title").textContent = title; $("modal-body").innerHTML = content; $("modal-submit").textContent = submitLabel;
-  $("modal-error").textContent = ""; $<HTMLButtonElement>("modal-submit").disabled = false;
-  $("modal").classList.remove("review-modal"); modalSubmit = submit; $<HTMLDialogElement>("modal").showModal();
-}
-$("modal-form").addEventListener("submit", event => {
-  event.preventDefault(); const button = $<HTMLButtonElement>("modal-submit"); button.disabled = true;
-  void modalSubmit(new FormData($<HTMLFormElement>("modal-form"))).then(() => { $<HTMLDialogElement>("modal").close(); }).catch(error => { $("modal-error").textContent = (error as Error).message; }).finally(() => { button.disabled = false; });
-});
-on("close-modal", () => $<HTMLDialogElement>("modal").close()); on("cancel-modal", () => $<HTMLDialogElement>("modal").close());
-function importModal(): void {
-  modal("New workspace", '<p>Import a Git repository or leave the URL empty to start fresh.</p><label>Workspace name<input name="name" placeholder="my-project" maxlength="80" required /></label><label>Repository URL<input name="repository" placeholder="https://github.com/you/project.git" maxlength="2048" /></label>', "Create workspace", async data => {
-    const workspace = await api<Workspace>("/workspaces", "POST", { name: data.get("name"), repository: data.get("repository") }); await refresh(); await chooseWorkspace(workspace.id);
+type PatchFile = { path: string; lines: string[]; binary: boolean; deleted: boolean };
+function patchFiles(patch: string): PatchFile[] {
+  return patch.split(/(?=^diff --git )/m).filter(part => part.startsWith("diff --git ")).map(part => {
+    const lines = part.split("\n"), before = lines.find(line => line.startsWith("--- "))?.slice(4), after = lines.find(line => line.startsWith("+++ "))?.slice(4);
+    let path = (after && after !== "/dev/null" ? after : before) ?? lines[0].replace(/^diff --git a\//, "").split(" b/")[0];
+    if (path.startsWith('"')) { try { path = JSON.parse(path); } catch { /* Keep the Git label. */ } }
+    return { path: path.replace(/^[ab]\//, ""), lines, binary: lines.some(line => line === "GIT binary patch" || line.startsWith("Binary files ")), deleted: after === "/dev/null" };
   });
 }
-on("new-workspace", importModal); on("welcome-new", importModal);
-// Keep the existing + control reachable when the sidebar is hidden on small screens.
-const compactNavigation = matchMedia("(max-width: 900px)");
-const workspaceButtonHome = $("new-workspace").parentElement!;
-function placeWorkspaceButton(): void {
-  (compactNavigation.matches ? document.querySelector<HTMLElement>(".topbar")! : workspaceButtonHome).append($("new-workspace"));
+function diff(file: PatchFile): string {
+  if (file.binary) return '<p class="quiet-line">Binary file changed. Inspect it in the repository before applying.</p>';
+  const lines = file.lines.filter(line => /^(\+\+\+|---|@@|\+|-| |\\)/.test(line) && !line.startsWith("+++") && !line.startsWith("---")).slice(0, 1200);
+  return `<div class="diff-lines">${lines.map(line => `<div class="diff-line ${line.startsWith("+") ? "addition" : line.startsWith("-") ? "removal" : line.startsWith("@@") ? "hunk" : ""}"><span aria-hidden="true">${html(line[0] ?? " ")}</span><code>${html(line.slice(1))}</code></div>`).join("")}</div>${file.lines.length > 1200 ? '<p class="quiet-line">Preview limited to 1,200 lines.</p>' : ""}`;
 }
-compactNavigation.addEventListener("change", placeWorkspaceButton); placeWorkspaceButton();
+function reviewPanel(id: string): string {
+  const proposal = proposals.get(id), source = workspace(id);
+  if (!proposal) return `<section class="review-panel"><p class="quiet-line">Capturing changes…</p></section>`;
+  const files = patchFiles(proposal.patch), index = Math.min(chosenFiles.get(id) ?? 0, Math.max(0, files.length - 1)), file = files[index];
+  return `<section class="review-panel" data-review="${id}">
+    <div class="review-title"><div><p class="eyebrow">${html(source?.kind === "agent" ? "Attempt" : "Experiment")}</p><h2>${html(source?.name ?? "Changes")}</h2></div><span class="review-count">${files.length} file${files.length === 1 ? "" : "s"}</span></div>
+    <pre class="review-summary">${html(proposal.summary || "No changes")}</pre>
+    ${files.length ? `<div class="file-picker" aria-label="Changed files">${files.map((entry, i) => `<button class="file-option ${i === index ? "active" : ""}" data-action="file" data-review="${id}" data-index="${i}" aria-pressed="${i === index}" type="button">${html(entry.path)}${entry.deleted ? " <small>deleted</small>" : entry.binary ? " <small>binary</small>" : ""}</button>`).join("")}</div><div class="file-diff"><div class="file-diff-head">${html(file.path)}</div>${diff(file)}</div>` : '<p class="quiet-line">This copy matches its starting point.</p>'}
+    <div class="review-footer"><button class="button primary" data-action="apply" data-review="${id}" type="button" ${!proposal.patch || !!proposal.appliedAt || !!source?.appliedAt ? "disabled" : ""}>${source?.appliedAt || proposal.appliedAt ? "Applied" : "Apply to project"}</button><span>Applies all changed files. No commit or push.</span></div>
+  </section>`;
+}
+function renderReview(item: AgentRun): string {
+  return `<div class="detail-body review-body"><button class="back-link" data-action="activity" type="button">Task activity</button><div class="detail-heading"><p class="eyebrow">Review</p><h1>${reviewIds.length > 1 ? "Compare attempts" : html(item.title ?? item.prompt)}</h1></div>${reviewIds.map(reviewPanel).join("")}</div>`;
+}
+function renderDetail(): void {
+  const item = run(), target = $("detail-content");
+  if (!item) { target.innerHTML = '<div class="detail-empty"><h2>Select a task</h2></div>'; return; }
+  const key = `${item.id}:${item.state}:${item.error}:${screen}:${eventCursor}:${approvals.map(value => value.id).join(",")}:${reviewIds.join(",")}:${[...proposals.values()].map(value => `${value.id}:${value.appliedAt}`).join(",")}:${[...chosenFiles].join(",")}`;
+  if (key === detailKey) return;
+  detailKey = key;
+  const prior = $("detail").scrollTop;
+  target.innerHTML = screen === "review" ? renderReview(item) : renderActivity(item);
+  $("detail").scrollTop = prior;
+}
+
+type DialogSubmit = (values: FormData) => Promise<void>;
+let dialogSubmit: DialogSubmit = async () => {};
+function dialog(kicker: string, title: string, fields: string, submitLabel: string, submit: DialogSubmit): void {
+  $("dialog-kicker").textContent = kicker; $("dialog-title").textContent = title; $("dialog-fields").innerHTML = fields;
+  $("dialog-submit").textContent = submitLabel; $("dialog-error").textContent = ""; dialogSubmit = submit;
+  $<HTMLDialogElement>("dialog").showModal();
+  $("dialog-fields").querySelector<HTMLInputElement | HTMLTextAreaElement>("input, textarea")?.focus();
+}
+function newProject(): void {
+  dialog("Project", "Add a project", '<label>Project name<input name="name" maxlength="80" placeholder="My project" required /></label><label>Git URL <span class="optional">optional</span><input name="repository" maxlength="2048" placeholder="https://github.com/you/project.git" /></label><p class="field-hint">Leave the URL empty to start from a blank repository.</p>', "Create project", async values => {
+    const created = await api<Workspace>("/workspaces", "POST", { name: values.get("name"), repository: values.get("repository") });
+    projectId = created.id; await refresh(); notice("Project created. Add a task when ready.");
+  });
+}
 function newTask(): void {
-  const projects = state.workspaces.filter(w => w.kind === "primary" && w.state !== "discarded");
-  if (!projects.length) { importModal(); return; }
-  if (dirty()) { toast("Save your editor changes before creating a task."); return; }
-  const parent = selected()?.parentId ?? selectedId;
-  modal("New task", `<label>Project<select name="project">${projects.map(w => `<option value="${w.id}" ${w.id === parent ? "selected" : ""}>${escape(w.name)}</option>`).join("")}</select></label><label>Task name<input name="name" placeholder="Add pagination" maxlength="80" required /></label><label>Instructions<textarea name="prompt" placeholder="Describe the change and how to verify it." maxlength="20000" required></textarea></label><label>Execution environment<select name="environment"><option value="isolated">Isolated copy — review before applying</option><option value="current">Primary workspace — edit its files directly</option></select></label><p>${state.system.docker ? "The task queues until execution capacity is available." : "Docker is offline. Isolated copies need Docker; primary workspace tasks can queue until it returns."}</p>`, "Create task", async data => {
-    const result = await api<{ workspace: Workspace; run: AgentRun }>(`/workspaces/${data.get("project")}/tasks`, "POST", { name: data.get("name"), prompt: data.get("prompt"), isolated: data.get("environment") === "isolated" });
-    await refresh(); await chooseWorkspace(result.workspace.id); selectedRunId = result.run.id; setView("tasks"); renderState(); await catchUp(result.run.id);
+  const projects = state.workspaces.filter(item => item.kind === "primary" && item.state !== "discarded");
+  if (!projects.length) { newProject(); return; }
+  dialog("New task", "New task", `<label>Project<select name="project">${projects.map(item => `<option value="${item.id}" ${item.id === projectId ? "selected" : ""}>${html(item.name)}</option>`).join("")}</select></label><label>Task name<input name="name" maxlength="80" placeholder="Add pagination" required /></label><label>Instructions<textarea name="prompt" maxlength="20000" rows="5" placeholder="What should change? How should it be checked?" required></textarea></label><fieldset><legend>Approach</legend><label class="choice"><input type="radio" name="approach" value="one" checked /> One attempt</label><label class="choice"><input type="radio" name="approach" value="two" /> Compare two attempts</label></fieldset><label id="other-prompt" hidden>Second approach<textarea name="other" maxlength="20000" rows="4" placeholder="Describe the alternative approach."></textarea></label><p class="field-hint">Changes stay in isolated copies until you apply them.</p>`, "Start task", async values => {
+    const id = String(values.get("project")), name = String(values.get("name")), prompt = String(values.get("prompt"));
+    if (values.get("approach") === "two") {
+      const other = String(values.get("other") ?? "").trim(); if (!other) throw new Error("Describe the second approach.");
+      const copies = await api<Workspace[]>(`/workspaces/${id}/parallel`, "POST", { tasks: [{ name: `${name} · A`, prompt }, { name: `${name} · B`, prompt: other }] });
+      await refresh(); const created = state.runs.find(item => item.workspaceId === copies[0].id); if (created) setSelection(created.id);
+    } else {
+      const result = await api<{ workspace: Workspace; run: AgentRun }>(`/workspaces/${id}/tasks`, "POST", { name, prompt, isolated: true });
+      await refresh(); setSelection(result.run.id);
+    }
   });
 }
-on("new-task", newTask);
-async function fromPrimary(button: string): Promise<void> {
-  const primary = state.workspaces.find(w => w.id === (selected()?.parentId ?? selectedId) && w.kind === "primary") ?? state.workspaces.find(w => w.kind === "primary");
-  if (!primary) { importModal(); return; }
-  await chooseWorkspace(primary.id); if (selectedId !== primary.id) return;
-  if ($<HTMLButtonElement>(button).disabled) { toast("Start Docker and finish the primary task before creating a snapshot."); return; }
-  $(button).click();
-}
-on("hub-experiment", () => fromPrimary("experiment-button")); on("hub-parallel", () => fromPrimary("parallel-button"));
-on("new-file", () => { const id = selectedId; modal("Create a file", '<label>File path<input name="path" placeholder="src/index.ts" required /></label>', "Create file", async data => { const path = String(data.get("path")); await api(`${workspacePath(id)}/file`, "PUT", { path, content: "", version: null }); if (id === selectedId) { await loadTree(); await openFile(path); } }); });
-on("environment-toggle", async () => {
-  const workspace = selected()!;
-  if (workspace.state === "running" && busy() && !confirm("Stop this environment and cancel its active task?")) return;
-  await api(`${workspacePath()}/${workspace.state === "running" ? "stop" : "start"}`, "POST", {}); await refresh();
-});
-on("experiment-button", () => {
-  if (dirty()) { toast("Save your editor changes before taking a snapshot."); return; }
-  const id = selectedId;
-  modal("New experiment", '<p>Create a separate copy of your current files. Changes here won’t affect the primary workspace until you apply them.</p><label>Experiment name<input name="name" placeholder="Try a different approach" required maxlength="80" /></label>', "Create experiment", async data => {
-    const copies = await api<Workspace[]>(`${workspacePath(id)}/experiment`, "POST", { name: data.get("name") }); await refresh(); await chooseWorkspace(copies[0].id); setView("experiments");
+function continueTask(): void {
+  const source = workspace(run()?.workspaceId ?? ""); if (!source) return;
+  dialog("Continue", "Continue task", '<label>Instructions<textarea name="prompt" maxlength="20000" rows="5" placeholder="What should it do next?" required></textarea></label>', "Send instruction", async values => {
+    const created = await api<AgentRun>(`/workspaces/${source.id}/runs`, "POST", { prompt: values.get("prompt") });
+    await refresh(); setSelection(created.id);
   });
-});
-on("parallel-button", () => {
-  if (dirty()) { toast("Save your editor changes before starting parallel tasks."); return; }
-  const id = selectedId;
-  modal("Parallel tasks", '<p>Both agents start from the same snapshot in separate environments. Tasks wait if your server is at capacity.</p><label>Agent A<textarea name="first" placeholder="Implement the first approach…" required maxlength="20000"></textarea></label><label>Agent B<textarea name="second" placeholder="Explore an alternative, or tackle another task…" required maxlength="20000"></textarea></label>', "Launch agents", async data => {
-    const copies = await api<Workspace[]>(`${workspacePath(id)}/parallel`, "POST", { tasks: [{ name: "Agent A", prompt: data.get("first") }, { name: "Agent B", prompt: data.get("second") }] }); await refresh(); await chooseWorkspace(copies[0].id);
-  });
-});
-async function discardWorkspace(id: string): Promise<void> {
-  if (id === selectedId && dirty()) { toast("Save or discard editor changes before removing this workspace."); return; }
-  if (!confirm("Permanently discard this temporary workspace and its files? Task history will remain.")) return;
-  const parentId = state.workspaces.find(w => w.id === id)!.parentId!;
-  await api(workspacePath(id), "DELETE");
-  if (id === selectedId) { documents.clear(); selectedId = ""; await refresh(); await chooseWorkspace(parentId); } else await refresh();
 }
-on("discard-button", () => discardWorkspace(selectedId));
-for (const id of ["review-button", "task-review"]) on(id, async () => { setView("review"); await reviews.open([selectedId]); });
-on("task-open-code", () => showCode(selectedId));
-async function showCode(id: string): Promise<void> { await chooseWorkspace(id); if (selectedId === id) setView("code"); }
-function setView(next: View): void {
-  view = next; $("app").classList.toggle("task-mode", next !== "code");
-  for (const name of ["tasks", "experiments", "review"] as const) $(`${name}-view`).hidden = name !== next;
-  document.querySelectorAll<HTMLElement>("[data-view]").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.view === next)));
-  $("sidebar-heading").textContent = next === "code" ? "EXPLORER" : "WORKSPACES";
-  (next === "code" ? $("studio") : $("task-conversation")).append($("agent-pane"));
-  if (state) renderState();
-  requestAnimationFrame(resizeTerminal);
+async function openReview(ids: string[]): Promise<void> {
+  reviewIds = ids; screen = "review"; proposals.clear(); chosenFiles.clear(); detailKey = ""; renderDetail();
+  await Promise.all(ids.map(async id => { try { proposals.set(id, await api<ChangeProposal>(`/workspaces/${id}/review`, "POST", {})); } catch (error) { notice((error as Error).message); } }));
+  renderDetail();
 }
-document.querySelectorAll<HTMLElement>("[data-view]").forEach(button => button.addEventListener("click", () => setView(button.dataset.view as View)));
 
-function detachTerminal(): void { terminalSocket?.close(); terminalSocket = undefined; terminalWorkspace = ""; terminal.reset(); }
-async function connectTerminal(): Promise<void> {
-  layout.revealTerminal();
-  if (terminalSocket?.readyState === WebSocket.OPEN && terminalWorkspace === selectedId) return;
-  detachTerminal(); const id = selectedId; terminalWorkspace = id;
-  const socket = new WebSocket(socketUrl(`/ws/terminal?workspaceId=${id}`)); terminalSocket = socket;
-  await new Promise<void>((resolve, reject) => {
-    socket.onopen = () => { $("terminal-message").hidden = true; resizeTerminal(); terminal.focus(); resolve(); };
-    socket.onerror = () => reject(new Error("Could not connect to the workspace terminal"));
-    socket.onmessage = event => {
-      const message = JSON.parse(event.data);
-      if (terminalSocket !== socket) return;
-      if (message.type === "scrollback") { terminal.reset(); terminal.write(message.data); }
-      if (message.type === "output") terminal.write(message.data);
-      if (message.type === "error") toast(message.error);
-      if (message.type === "exit") terminal.writeln(`\r\nShell exited (${message.exitCode}). Reconnect to open another shell.`);
-    };
-    socket.onclose = () => { if (terminalSocket === socket) { terminalSocket = undefined; terminalWorkspace = ""; } };
-  });
-}
-on("connect-terminal", connectTerminal);
-on("codex-login", async () => { setView("code"); await connectTerminal(); terminalSocket!.send(JSON.stringify({ type: "input", data: "codex login --device-auth\r" })); terminal.focus(); });
-
-$("prompt-form").addEventListener("submit", event => {
-  event.preventDefault(); void action(async () => {
-    const input = $<HTMLTextAreaElement>("prompt"), prompt = input.value.trim(); if (!prompt || busy()) return;
-    $<HTMLButtonElement>("send-prompt").disabled = true;
-    try { const run = await api<AgentRun>(`${workspacePath()}/runs`, "POST", { prompt }); input.value = ""; selectedRunId = run.id; await refresh(); }
-    finally { renderControls(); }
-  });
+$("project-options").addEventListener("click", event => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-project]"); if (!button) return;
+  projectId = button.dataset.project!; $<HTMLDetailsElement>("project-switcher").open = false;
+  renderProjects(); renderList();
 });
-$("run-history").addEventListener("change", event => { selectedRunId = (event.target as HTMLSelectElement).value; renderControls(); void action(() => catchUp(selectedRunId)); });
-on("cancel-run", async () => { if (!confirm("Cancel this task? Its environment and terminal will stop; files will remain.")) return; await api(`/runs/${selectedRunId}/cancel`, "POST", {}); await refresh(); });
-
-async function catchUp(id: string): Promise<void> {
-  if (!id) return;
-  const events = runEvents.get(id) ?? []; runEvents.set(id, events);
-  for (;;) {
-    const batch = await api<RunEvent[]>(`/runs/${id}/events?after=${events.at(-1)?.sequence ?? 0}`);
-    for (const event of batch) if (event.sequence > (events.at(-1)?.sequence ?? 0)) events.push(event);
-    if (batch.length < 500) break;
+document.addEventListener("click", event => {
+  const switcher = $<HTMLDetailsElement>("project-switcher");
+  if (switcher.open && !switcher.contains(event.target as Node)) switcher.open = false;
+});
+$("project-switcher").addEventListener("keydown", event => {
+  if (event.key === "Escape") { $<HTMLDetailsElement>("project-switcher").open = false; $<HTMLElement>("project-switcher").querySelector("summary")?.focus(); }
+});
+$("new-project").addEventListener("click", newProject);
+$("new-task").addEventListener("click", newTask);
+for (const name of ["open", "all"] as const) $(`filter-${name}`).addEventListener("click", () => { filter = name; renderList(); });
+$("task-list").addEventListener("click", event => {
+  const target = event.target as HTMLElement;
+  const action = target.closest<HTMLElement>("[data-action]")?.dataset.action;
+  if (action === "new-project") { newProject(); return; }
+  if (action === "new-task") { newTask(); return; }
+  const id = target.closest<HTMLElement>("[data-run]")?.dataset.run;
+  if (id) setSelection(id);
+});
+$("detail-content").addEventListener("click", event => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-action]"); if (!button) return;
+  const action = button.dataset.action!, source = workspace(run()?.workspaceId ?? "");
+  if (action === "back") { mobileDetailOpen = false; $("shell").classList.remove("show-detail"); return; }
+  if (action === "activity") { screen = "activity"; detailKey = ""; renderDetail(); return; }
+  if (action === "continue") { continueTask(); return; }
+  if (action === "file") { chosenFiles.set(button.dataset.review!, Number(button.dataset.index)); detailKey = ""; renderDetail(); return; }
+  if (action === "review" && source) { void runAction(() => openReview([source.id])); return; }
+  if (action === "compare" && source && button.dataset.other) { void runAction(() => openReview([source.id, button.dataset.other!])); return; }
+  if (action === "approve" || action === "decline") {
+    button.disabled = true;
+    void runAction(async () => { await api(`/runs/${selectedRunId}/approvals`, "POST", { requestId: button.dataset.request, accepted: action === "approve" }); await refresh(); }); return;
   }
-  if (id !== selectedRunId) return;
-  renderRun(id, events);
-  board.activity(state.runs.find(run => run.id === id), events);
-  const approvals = await api<Array<{ id: string | number; method: string; params: Record<string, unknown> }>>(`/runs/${id}/approvals`);
-  if (id !== selectedRunId) return;
-  $("approvals").innerHTML = approvals.map(request => `<div class="approval"><strong>Approval requested</strong><p>${escape(String(request.params.command ?? request.params.reason ?? "Allow the proposed file changes?"))}</p><button data-approval="${escape(String(request.id))}" data-accepted="true">Allow</button><button data-approval="${escape(String(request.id))}" data-accepted="false">Decline</button></div>`).join("");
-}
-function renderRun(id: string, events: RunEvent[]): void {
-  const run = state.runs.find(run => run.id === id); if (!run) return;
-  const output = $("agent-output"), nearBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 80;
-  const renderKey = `${id}:${events.at(-1)?.sequence ?? 0}:${run.state}:${run.error ?? ""}`;
-  if (output.dataset.renderKey === renderKey) return;
-  output.dataset.renderKey = renderKey;
-  const expanded = new Set(Array.from(output.querySelectorAll<HTMLDetailsElement>("details[open]")).map(item => item.dataset.item));
-  const items = new Map<string, { type: string; text: string; title: string }>();
-  for (const event of events) {
-    const data = event.data as any;
-    if (event.type === "item/agentMessage/delta") {
-      const key = data.itemId ?? "message", item = items.get(key) ?? { type: "message", text: "", title: "" }; item.text += data.delta ?? ""; items.set(key, item);
-    } else if (event.type === "item/commandExecution/outputDelta") {
-      const key = data.itemId ?? "command", item = items.get(key) ?? { type: "tool", text: "", title: "Command" }; item.text += data.delta ?? ""; items.set(key, item);
-    } else if ((event.type === "item/started" || event.type === "item/completed") && data.item) {
-      const item = data.item;
-      if (item.type === "agentMessage") items.set(item.id, { type: "message", text: item.text ?? items.get(item.id)?.text ?? "", title: "" });
-      else if (item.type === "commandExecution") items.set(item.id, { type: "tool", title: `${item.command ?? "Command"} · ${item.status ?? "running"}${item.exitCode != null ? ` (${item.exitCode})` : ""}`, text: item.aggregatedOutput ?? items.get(item.id)?.text ?? "" });
-      else if (item.type === "fileChange") items.set(item.id, { type: "tool", title: `File changes · ${item.status ?? "pending"}`, text: JSON.stringify(item.changes ?? [], null, 2) });
-    } else if (event.type === "adapter/unsupported") items.set(String(event.sequence), { type: "tool", title: "Unsupported Codex request", text: data.method });
+  if (action === "cancel") {
+    if (!confirm("Cancel this run? Its files will remain available for review.")) return;
+    button.disabled = true; void runAction(async () => { await api(`/runs/${selectedRunId}/cancel`, "POST", {}); await refresh(); }); return;
   }
-  output.innerHTML = `<div class="message user"><span class="message-label">YOU</span>${escape(run.prompt)}</div>` + [...items].map(([key,item]) => item.type === "message" ? `<div class="message"><span class="message-label">CODEX</span>${escape(item.text)}</div>` : `<details class="tool-event" data-item="${escape(key)}" ${expanded.has(key) ? "open" : ""}><summary>${escape(item.title)}</summary><pre>${escape(item.text.slice(-20000))}</pre></details>`).join("") + (run.error ? `<div class="run-error">${escape(run.error)}</div>` : "") + (!items.size && !finished.has(run.state) ? `<p class="small muted">${run.state === "queued" ? "Queued — waiting for available execution capacity." : "Codex is working…"}</p>` : "");
-  if (nearBottom) output.scrollTop = output.scrollHeight;
-}
-$("approvals").addEventListener("click", event => { const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-approval]"); if (button) void action(async () => { button.disabled = true; await api(`/runs/${selectedRunId}/approvals`, "POST", { requestId: button.dataset.approval, accepted: button.dataset.accepted === "true" }); await refresh(); }); });
-
-async function enter(): Promise<void> {
-  authenticated = true;
-  await refresh(); connectEvents();
-  const first = state.workspaces.find(workspace => workspace.kind === "primary" && workspace.state !== "discarded"); if (first) await chooseWorkspace(first.id);
-}
-commandPalette([
-  { label: "Task: New task", run: newTask },
-  { label: "View: Tasks", run: () => setView("tasks") },
-  { label: "View: Experiments", run: () => setView("experiments") },
-  { label: "View: Review changes", run: () => setView("review") },
-  { label: "View: Code IDE", run: () => setView("code") },
-  { label: "Workspace: New / Clone repository", run: importModal },
-  { label: "File: New file", run: () => { setView("code"); $("new-file").click(); }, enabled: () => !!selectedId && selected()?.state !== "discarded" },
-  { label: "File: Save", run: () => void action(saveFile), enabled: () => !!currentFile },
-  { label: "File: Close editor", run: () => void action(() => closeFile(currentFile)), enabled: () => !!currentFile },
-  { label: "View: Toggle sidebar", run: () => layout.toggle("sidebar") },
-  { label: "View: Toggle terminal", run: () => layout.toggle("terminal") },
-  { label: "View: Toggle Codex panel", run: () => layout.toggle("agent") },
-  { label: "View: Move Codex panel to other side", run: () => $("move-agent").click() },
-  { label: "View: Reset layout", run: () => layout.reset() },
-  { label: "Workspace: New experiment", run: () => $("experiment-button").click(), enabled: () => selected()?.kind === "primary" && !$<HTMLButtonElement>("experiment-button").disabled },
-]);
-window.addEventListener("beforeunload", event => { if (dirty()) { event.preventDefault(); event.returnValue = ""; } });
-window.setInterval(() => { if (authenticated) scheduleRefresh(); }, 5000);
-setView("tasks");
-void enter().catch(error => { $("connection-error").hidden = false; $("connection-error").textContent = (error as Error).message; });
+  if (action === "discard" && source) {
+    if (!confirm("Discard this copy and its files? Task history will remain.")) return;
+    button.disabled = true; void runAction(async () => { await api(`/workspaces/${source.id}`, "DELETE"); await refresh(); }); return;
+  }
+  if (action === "apply") {
+    const proposal = proposals.get(button.dataset.review ?? ""); if (!proposal) return;
+    if (!confirm("Apply every changed file to the primary project? This does not commit or push.")) return;
+    button.disabled = true; void runAction(async () => {
+      const applied = await api<ChangeProposal>(`/changes/${proposal.id}/apply`, "POST", {});
+      proposal.appliedAt = applied.appliedAt; await refresh(); detailKey = ""; renderDetail(); notice("Changes applied to the project.");
+    });
+  }
+});
+$("dialog-fields").addEventListener("change", event => {
+  const target = event.target as HTMLInputElement;
+  if (target.name === "approach") {
+    const two = target.value === "two"; const field = $("other-prompt"); field.hidden = !two;
+    field.querySelector("textarea")!.required = two;
+  }
+});
+$("dialog-form").addEventListener("submit", event => {
+  event.preventDefault(); const submit = $<HTMLButtonElement>("dialog-submit"); submit.disabled = true;
+  void dialogSubmit(new FormData($<HTMLFormElement>("dialog-form"))).then(() => $<HTMLDialogElement>("dialog").close()).catch(error => { $("dialog-error").textContent = (error as Error).message; }).finally(() => submit.disabled = false);
+});
+for (const id of ["close-dialog", "dialog-cancel"]) $(id).addEventListener("click", () => $<HTMLDialogElement>("dialog").close());
+window.addEventListener("popstate", () => setSelection(new URL(location.href).searchParams.get("run") ?? ""));
+window.setInterval(() => void runAction(refresh), 5000);
+void runAction(async () => { await refresh(); connect(); });

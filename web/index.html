@@ -3,71 +3,54 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="Relay development workspace" />
+    <meta name="theme-color" content="#f4f3ee" />
+    <meta name="description" content="Relay agent tasks" />
     <title>Relay</title>
   </head>
   <body>
-    <!-- Task workspace with experiments/reviews, plus an on-demand IDE using the same live sessions. -->
-    <div id="app" class="app task-mode">
-      <header class="topbar">
-        <span class="brand">relay</span>
-        <nav class="view-switcher" aria-label="Workspace views"><button id="view-tasks" data-view="tasks" aria-pressed="true">Tasks</button><button id="view-experiments" data-view="experiments" aria-pressed="false">Experiments</button><button id="view-review" data-view="review" aria-pressed="false">Review</button><button id="view-code" data-view="code" aria-pressed="false">Code</button></nav>
-        <button id="command-button" class="command-button" title="Command palette (Ctrl+Shift+P)"><span id="window-title">Commands</span><kbd>Ctrl Shift P</kbd></button>
-        <div class="title-actions ide-only">
-          <button id="toggle-sidebar" class="icon-button" title="Toggle sidebar (Ctrl+B)" aria-label="Toggle sidebar" aria-pressed="true"><svg viewBox="0 0 20 20"><rect x="2" y="3" width="16" height="14" rx="1"/><path d="M7 3v14"/></svg></button>
-          <button id="toggle-terminal" class="icon-button" title="Toggle terminal (Ctrl+J)" aria-label="Toggle terminal" aria-pressed="true"><svg viewBox="0 0 20 20"><rect x="2" y="3" width="16" height="14" rx="1"/><path d="M2 12h16"/></svg></button>
-          <button id="toggle-agent" class="icon-button" title="Toggle Codex panel" aria-label="Toggle Codex panel" aria-pressed="true"><svg viewBox="0 0 20 20"><rect x="2" y="3" width="16" height="14" rx="1"/><path d="M13 3v14"/></svg></button>
+    <div id="app">
+      <header class="masthead">
+        <div class="masthead-actions">
+          <button id="new-task" class="button primary" type="button">New task</button>
         </div>
       </header>
-      <nav class="activitybar" aria-label="Views">
-        <button id="activity-explorer" title="Explorer (Ctrl+B)" aria-label="Explorer" aria-pressed="true"><svg viewBox="0 0 24 24"><path d="M8 3h10l3 3v15H8zM8 3v3H3v13h5M17 3v5h4"/></svg></button>
-        <button id="activity-agent" title="Codex" aria-label="Codex" aria-pressed="true"><svg viewBox="0 0 24 24"><path d="M4 4h16v13H9l-5 4zM8 8l-2 3 2 3m8-6 2 3-2 3m-3-7-2 8"/></svg></button>
-        <button id="activity-terminal" title="Terminal (Ctrl+J)" aria-label="Terminal" aria-pressed="true"><svg viewBox="0 0 24 24"><path d="m4 6 6 6-6 6m9 0h7"/></svg></button>
-      </nav>
-      <aside id="sidebar" class="sidebar">
-        <div class="pane-heading"><span id="sidebar-heading">WORKSPACES</span> <button id="new-workspace" class="icon-button" title="New workspace" aria-label="New workspace">+</button></div>
-        <details id="workspace-section" open><summary class="section-heading">WORKSPACES</summary><div id="workspaces" class="workspace-list"></div></details>
-        <section class="explorer ide-only">
-          <div class="section-heading"><span id="explorer-name">FILES</span><div><button id="new-file" class="icon-button" title="New file" aria-label="New file" disabled>+</button><button id="refresh-files" class="icon-button" title="Refresh files" aria-label="Refresh files" disabled>↻</button></div></div>
-          <div id="file-tree" class="file-tree"><p class="muted small">Open a workspace to browse files.</p></div>
-        </section>
-      </aside>
-      <div id="sidebar-resizer" class="resizer vertical" role="separator" tabindex="0" aria-label="Resize sidebar" aria-orientation="vertical" aria-controls="sidebar"></div>
-      <main class="main-area">
-        <div id="workspace-header" hidden>          <div class="workspace-bar"><div class="workspace-title"><span id="workspace-kind">PRIMARY</span><h1 id="workspace-name"></h1></div><div class="workspace-actions"><button id="environment-toggle">Start environment</button><button id="experiment-button">Experiment</button><button id="parallel-button">Parallel tasks</button><button id="review-button" hidden>Review changes</button><button id="discard-button" class="danger quiet" hidden>Discard</button></div></div>
-          <div id="runtime-notice" class="notice" hidden></div>
-</div>
-        <section id="tasks-view" class="hub-view">
-          <header class="hub-heading"><div><h1>Tasks</h1><p>Assign work, follow execution, and review the result.</p></div><button id="new-task" class="primary">New task</button></header>
-          <div id="task-summary" class="task-summary"></div>
-          <div class="task-filters"><label class="sr-only" for="task-search">Search tasks</label><input id="task-search" placeholder="Search tasks?" /><label class="sr-only" for="task-filter">Task status</label><select id="task-filter"><option value="all">All statuses</option><option value="active">Active</option><option value="queued">Queued</option><option value="waiting">Needs approval</option><option value="completed">Completed</option><option value="failed">Failed / interrupted</option></select><label class="sr-only" for="task-project">Project</label><select id="task-project"><option value="all">All projects</option></select></div>
-          <div class="task-workbench"><div id="task-list" class="task-list" aria-label="Tasks"></div><section class="task-detail"><header class="task-detail-heading"><div><h2 id="task-detail-title">Select a task</h2><p id="task-detail-status">Choose a task to inspect its activity.</p></div><div><button id="task-open-code">Open code</button><button id="task-review">Review changes</button></div></header><div id="task-conversation"></div></section></div>
-        </section>
-        <section id="experiments-view" class="hub-view" hidden><header class="hub-heading"><div><h1>Experiments</h1><p>Independent copies of your project. Compare approaches before applying changes.</p></div><div><button id="hub-experiment">New experiment</button><button id="hub-parallel">Parallel tasks</button><button id="compare-experiments" class="primary" disabled>Compare changes (0/2)</button></div></header><div id="experiment-list" class="experiment-list"></div></section>
-        <section id="review-view" class="hub-view" hidden><header class="hub-heading"><div><h1>Review changes</h1><p>Inspect a saved diff, then explicitly apply it to its primary workspace.</p></div><div><label class="sr-only" for="review-target">Review target</label><select id="review-target"><option value="">Select an experiment?</option></select><button id="load-review">Load review</button></div></header><div id="review-panels" class="review-panels"><div class="hub-empty"><h2>No review selected</h2><p>Choose an experiment, or compare two from the Experiments view.</p></div></div></section>
-        <section id="welcome" class="welcome" hidden>
-          <h1>Code</h1><p class="welcome-subtitle">Open a workspace to start editing.</p>
-          <div class="welcome-columns"><div><h2>Start</h2><button id="welcome-new" class="text-button">New workspace / Clone repository…</button><button id="welcome-commands" class="text-button">Show all commands…</button></div><div><h2>Shortcuts</h2><dl><dt>Command palette</dt><dd><kbd>Ctrl Shift P</kbd></dd><dt>Toggle sidebar</dt><dd><kbd>Ctrl B</kbd></dd><dt>Toggle terminal</dt><dd><kbd>Ctrl J</kbd></dd><dt>Save file</dt><dd><kbd>Ctrl S</kbd></dd></dl></div></div>
-          <p id="connection-error" class="error" role="alert" hidden></p>
-        </section>
-        <section id="workspace-view" class="workspace-view" hidden>
-          <div id="studio" class="studio">
-            <section id="code-column" class="code-column">
-              <div class="editor-toolbar"><div id="file-tabs" class="file-tabs" role="tablist" aria-label="Open files"></div><button id="reload-file" class="quiet" title="Reload file from disk" aria-label="Reload file">↻</button><button id="save-file" class="quiet" disabled>Save</button></div>
-              <div class="editor-region"><div id="editor-placeholder" class="editor-placeholder"><span class="code-icon">{ }</span><p>Open a file to start editing.</p><span class="keyboard-hint">Ctrl / ⌘ S to save · Ctrl / ⌘ F to find</span></div><div id="editor" hidden></div></div>
-              <div class="editor-status"><span id="file-status">No file open</span><span>UTF-8</span></div>
-              <div id="terminal-resizer" class="resizer horizontal" role="separator" tabindex="0" aria-label="Resize terminal" aria-orientation="horizontal" aria-controls="terminal-pane"></div>
-              <section id="terminal-pane" class="terminal-pane"><div class="pane-heading"><span>TERMINAL</span><div><button id="codex-login" class="quiet">Log into Codex</button><button id="connect-terminal" class="quiet">Connect</button><button id="maximize-terminal" class="icon-button" title="Maximize terminal" aria-label="Maximize terminal" aria-pressed="false">□</button><button id="close-terminal" class="icon-button" title="Hide terminal" aria-label="Hide terminal">×</button></div></div><div id="terminal-message" class="terminal-message">Start the environment to use its terminal.</div><div id="terminal"></div></section>
-            </section>
-            <div id="agent-resizer" class="resizer vertical" role="separator" tabindex="0" aria-label="Resize Codex panel" aria-orientation="vertical" aria-controls="agent-pane"></div>
-            <aside id="agent-pane" class="agent-pane"><div class="pane-heading"><span>CODEX</span><div><span id="agent-state" class="badge">Ready</span><button id="move-agent" class="icon-button" title="Move Codex panel to the other side" aria-label="Move Codex panel">⇄</button><button id="close-agent" class="icon-button" title="Hide Codex panel" aria-label="Hide Codex panel">×</button></div></div><div class="run-picker"><label for="run-history" class="sr-only">Task history</label><select id="run-history"><option value="">No tasks yet</option></select><button id="cancel-run" class="quiet danger" hidden>Cancel</button></div><div id="agent-output" class="agent-output"><div class="agent-empty"><h2>No active task</h2><p>Start an environment and sign into Codex to run a task.</p></div></div><div id="approvals"></div><form id="prompt-form" class="prompt-form"><label for="prompt" class="sr-only">Task for Codex</label><textarea id="prompt" rows="3" placeholder="Describe a task…" maxlength="20000" required></textarea><div class="prompt-footer"><span>Current workspace</span><button id="send-prompt" class="primary" type="submit">Run task</button></div></form></aside>
+
+      <main class="shell" id="shell">
+        <section class="inbox" id="inbox" aria-label="Tasks">
+          <div class="section-top">
+            <div class="project-heading">
+              <p class="eyebrow">Tasks For</p>
+              <details id="project-switcher" class="project-switcher">
+                <summary><span id="project-title">All projects</span><span class="project-chevron" aria-hidden="true"></span></summary>
+                <div id="project-options" class="project-options" role="group" aria-label="Projects"></div>
+              </details>
+            </div>
+            <button id="new-project" class="text-button" type="button">New project</button>
           </div>
+          <div class="inbox-tools">
+            <button id="filter-open" class="filter active" type="button" aria-pressed="true">Open</button>
+            <button id="filter-all" class="filter" type="button" aria-pressed="false">All</button>
+            <span id="updated-at" class="updated-at"></span>
+          </div>
+          <div id="task-list" class="task-list" aria-live="polite"></div>
+        </section>
+
+        <section class="detail" id="detail" aria-label="Task detail">
+          <div id="detail-content"></div>
         </section>
       </main>
+
+      <dialog id="dialog" class="dialog">
+        <form id="dialog-form">
+          <div class="dialog-head"><p id="dialog-kicker" class="eyebrow"></p><button id="close-dialog" class="icon-button" type="button" aria-label="Close dialog">×</button></div>
+          <h2 id="dialog-title"></h2>
+          <div id="dialog-fields"></div>
+          <p id="dialog-error" class="form-error" role="alert"></p>
+          <div class="dialog-actions"><button id="dialog-cancel" class="button" type="button">Cancel</button><button id="dialog-submit" class="button primary" type="submit">Continue</button></div>
+        </form>
+      </dialog>
+      <div id="toast" class="toast" role="status" hidden></div>
     </div>
-    <dialog id="palette" class="palette" aria-label="Command palette"><input id="command-search" aria-label="Search commands" placeholder="Type a command…" autocomplete="off" /><div id="command-results"></div><p class="palette-help">↑ ↓ navigate · Enter run · Esc close</p></dialog>
-    <dialog id="modal"><form id="modal-form"><div class="modal-top"><span>RELAY</span><button type="button" id="close-modal" class="icon-button" aria-label="Close dialog">×</button></div><h2 id="modal-title"></h2><div id="modal-body"></div><p id="modal-error" class="error" role="alert"></p><div class="modal-footer"><button type="button" id="cancel-modal">Cancel</button><button id="modal-submit" class="primary" type="submit">Create</button></div></form></dialog>
-    <div id="toast" class="toast" role="status" hidden></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
