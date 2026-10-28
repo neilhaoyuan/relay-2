@@ -1,8 +1,10 @@
-# Relay
+WIP - use at your own discretion
+
+<img width="939" height="472" alt="image" src="https://github.com/user-attachments/assets/1027ad8b-7625-46d9-9cd5-c75ba0ca0972" />
 
 Relay is a small, self-hosted control room for coding agents. Give Codex a task from your phone or desktop, leave it running on your server, and return to see what happened. You can answer approval requests, continue a run, compare two attempts, and review changes before applying them to your project.
 
-The interface has a task inbox and a focused detail view. On desktop they sit side by side; on mobile you open one task at a time. Relay does not include a browser IDE or terminal.
+The interface has a task inbox and a focused detail view. On desktop they sit side by side; on mobile you open one task at a time.
 
 ## How it works
 
@@ -19,7 +21,7 @@ See the [Linux VM setup guide](docs/vm_setup.md) for setup. You'll need a Linux 
 
 Once configured, connect Tailscale on your device and open your server's Relay URL. Your server hosts the platform and stores your work.
 
-Relay is intended for one owner working on trusted repositories. Remote access is controlled by Tailscale; there is no separate Relay login. Future plans for this project include allowing for multiple owners to access without need tailscale. Seperate auth is WIP tho. 
+Relay is intended for one owner working on trusted repositories. Remote access is controlled by Tailscale. Future plans for this project include allowing for multiple owners to access without need tailscale. Seperate auth is WIP tho. 
 
 ## Note
 
